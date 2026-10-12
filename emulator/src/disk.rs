@@ -187,6 +187,10 @@ pub struct DiskDrive {
     disable_disk_jitter: bool,
 
     stepper_pending: bool,
+
+    pending_start_cycle: usize,
+
+    pending_elapsed_ticks: usize,
 }
 
 // Q0L: Phase 0 OFF
@@ -1414,6 +1418,8 @@ impl DiskDrive {
             exact_write: false,
             disable_disk_jitter: false,
             stepper_pending: false,
+            pending_start_cycle: 0,
+            pending_elapsed_ticks: 0,
         }
     }
 
@@ -1432,10 +1438,13 @@ impl DiskDrive {
             self.drive[self.drive_select].motor_status = true;
             if self.pending_ticks > 0 {
                 self.pending_ticks = 0;
+                self.pending_elapsed_ticks = 0;
             }
         } else if self.drive[self.drive_select].motor_status && self.pending_ticks == 0 {
             if !self.iwm || self.iwm_mode & 0x4 == 0 {
                 self.pending_ticks = PENDING_WAIT;
+                self.pending_start_cycle = self.cycles;
+                self.pending_elapsed_ticks = 0;
             } else {
                 // Set the motor off immediately if the IWM timer of 1 second is off
                 self.drive[self.drive_select].motor_status = false;
@@ -2796,8 +2805,13 @@ impl Tick for DiskDrive {
         }
 
         if self.pending_ticks > 0 {
+            self.pending_elapsed_ticks = self.pending_elapsed_ticks.saturating_add(1);
             self.pending_ticks -= 1;
             if self.pending_ticks == 0 {
+                let shutdown_cycle = self
+                    .pending_start_cycle
+                    .saturating_add(self.pending_elapsed_ticks);
+                self.update_cycles(shutdown_cycle);
                 self.fast_disk_timer = 0;
                 self.reset_disk_sound_sample();
                 for drive in 0..self.drive.len() {
@@ -3309,4 +3323,40 @@ mod accuracy_tests {
     // BMOW's logic-analyzer measurement found about 3.9205 us per written bit,
     // corresponding to four Apple II CPU cycles per bit cell. Verify this
     // emulator's steady-state read cursor cadence in CPU cycles (not wall time).
+    #[test]
+    fn ordinary_motor_off_retains_one_second_delay() {
+        let mut d = fixture();
+        d.motor_status(false);
+        assert!(d.is_motor_on());
+        assert_eq!(d.pending_ticks, PENDING_WAIT);
+        for _ in 0..PENDING_WAIT - 1 { d.tick(); }
+        assert!(d.is_motor_on());
+        d.tick();
+        assert!(!d.is_motor_on());
+    }
+
+    #[test]
+    fn cancelling_pending_shutdown_keeps_motor_running() {
+        let mut d = fixture();
+        d.motor_status(false);
+        d.tick();
+        d.motor_status(true);
+        assert_eq!(d.pending_ticks, 0);
+        assert!(d.is_motor_on());
+    }
+
+    #[test]
+    fn motor_shutdown_is_independent_of_controller_polling() {
+        let (mut a, mut b) = (fixture(), fixture());
+        a.motor_status(false); b.motor_status(false);
+        // Shorten only the countdown; both machines get the same 100 CPU cycles.
+        a.pending_ticks = 100; b.pending_ticks = 100;
+        for cycle in 1..=100 {
+            a.update_cycles(cycle);
+            a.tick(); b.tick();
+        }
+        b.update_cycles(100);
+        assert_eq!(signature(&a), signature(&b));
+    }
+
 }
