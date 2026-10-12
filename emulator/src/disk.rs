@@ -172,6 +172,8 @@ pub struct DiskDrive {
     enable_save: bool,
     fast_disk_timer: usize,
 
+    unloaded_cycle_remainder: usize,
+
     #[cfg_attr(feature = "serde_support", serde(default))]
     phase: usize,
 
@@ -1404,6 +1406,7 @@ impl DiskDrive {
             disable_fast_disk: false,
             enable_save: false,
             fast_disk_timer: 0,
+            unloaded_cycle_remainder: 0,
             phase: 0,
             disk_sound: DiskSound::default(),
             exact_write: false,
@@ -1485,23 +1488,17 @@ impl DiskDrive {
 
     fn update_cycles(&mut self, cycles: usize) {
         if self.is_motor_on() && cycles != self.cycles {
-            let disk = &mut self.drive[self.drive_select];
-            let tmap_track = disk.tmap_data[disk.track as usize];
-
-            let track_bits = if tmap_track == 255 {
-                NOMINAL_USABLE_BITS_TRACK_SIZE
-            } else {
-                disk.raw_track_bits[tmap_track as usize]
-            };
-
+            let elapsed_cycles = cycles.saturating_sub(self.cycles);
             let disk_loaded = self.is_loaded(self.drive_select);
-            let steps = cycles.saturating_sub(self.cycles) % track_bits;
+            let remainder = self.unloaded_cycle_remainder + elapsed_cycles % 4;
+            let unloaded_bit_steps = elapsed_cycles / 4 + remainder / 4;
+            self.unloaded_cycle_remainder = remainder % 4;
             if disk_loaded {
-                for _ in 0..steps {
+                for _ in 0..elapsed_cycles {
                     self.tick_internal();
                 }
             } else {
-                for _ in (0..steps).step_by(4) {
+                for _ in 0..unloaded_bit_steps {
                     self.prev_latch = self.latch;
                     self.latch = self.latch << 1 | Self::get_random_disk_bit(self.random_one_rate);
                 }
@@ -2988,4 +2985,152 @@ fn default_tmap_data() -> Vec<u8> {
 #[cfg(feature = "serde_support")]
 fn default_trackmap() -> Vec<TrackType> {
     vec![TrackType::None; WOZ_TMAP_SIZE]
+}
+
+#[cfg(test)]
+mod accuracy_tests {
+    //! Synthetic Disk II tests. Included as a child of disk.rs for private-state access.
+    //! See README.md for evidence levels and opt-in known-gap tests.
+    use super::*;
+
+    fn fixture() -> DiskDrive {
+        let mut d = DiskDrive::new();
+        d.disable_disk_jitter = true;
+        d.random_one_rate = 0.0;
+        d.exact_write = true;
+        for disk in &mut d.drive {
+            disk.loaded = true;
+            disk.track = 4;
+            disk.last_track = 4;
+            disk.tmap_data.fill(0);
+            disk.raw_track_data[0] = vec![0x96; 6378];
+            disk.raw_track_bits[0] = 51024;
+            disk.trackmap[0] = TrackType::Tmap;
+        }
+        d.motor_status(true);
+        d
+    }
+
+    // Includes media and transient controller fields, excluding unrelated audio buffers.
+    fn signature(d: &DiskDrive) -> u64 {
+        use std::hash::Hasher;
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        let state = format!("{:?}|{:?}|{:?}",
+            (d.cycles, d.drive_select, d.bus, d.latch, d.prev_latch, d.q6, d.q7,
+             d.pulse, d.bit_buffer, d.lss_cycle, d.lss_state, d.prev_lss_state),
+            (d.pending_ticks, d.phase), d.drive);
+        hash.write(state.as_bytes());
+        hash.finish()
+    }
+
+    fn incremental(d: &mut DiskDrive, until: usize) {
+        for cycle in d.cycles + 1..=until { d.update_cycles(cycle); }
+    }
+
+    #[test]
+    fn batching_short_intervals_preserves_read_state() {
+        let (mut a, mut b) = (fixture(), fixture());
+        incremental(&mut a, 1000);
+        b.update_cycles(1000);
+        assert_eq!(signature(&a), signature(&b));
+    }
+
+    #[test]
+    fn batching_unloaded_drive_intervals_preserves_read_state() {
+        let (mut a, mut b) = (fixture(), fixture());
+        a.drive[0].loaded = false;
+        b.drive[0].loaded = false;
+        a.random_one_rate = 0.0;
+        b.random_one_rate = 0.0;
+        incremental(&mut a, 1000);
+        b.update_cycles(1000);
+        assert_eq!(signature(&a), signature(&b));
+    }
+
+    #[test]
+    fn batching_long_intervals_preserves_read_state() {
+        for end in [51023, 51024, 51025, 102049] {
+            let (mut a, mut b) = (fixture(), fixture());
+            incremental(&mut a, end);
+            b.update_cycles(end);
+            assert_eq!(signature(&a), signature(&b), "elapsed CPU cycles={end}");
+        }
+    }
+
+    #[test]
+    fn elapsed_track_bit_count_is_not_zero_elapsed_time() {
+        let mut d = fixture();
+        d.update_cycles(51024);
+        assert_ne!((d.drive[0].head, d.drive[0].head_bit), (0, 0));
+    }
+
+    #[test]
+    fn batching_long_intervals_preserves_written_media() {
+        let (mut a, mut b) = (fixture(), fixture());
+        for d in [&mut a, &mut b] { d.q7 = true; d.q6 = true; d.bus = 0xa5; }
+        incremental(&mut a, 51024);
+        b.update_cycles(51024);
+        assert!(a.drive[0].modified, "positive control: reference must write");
+        assert!(a.drive[0].raw_track_data == b.drive[0].raw_track_data, "media bytes differ");
+        assert_eq!(signature(&a), signature(&b));
+    }
+
+    #[test]
+    fn read_mode_never_changes_disk_media() {
+        let mut d = fixture();
+        d.q7 = false;
+        d.q6 = true;
+        let before = d.drive[0].raw_track_data[0].clone();
+        d.update_cycles(1000);
+        assert_eq!(d.drive[0].raw_track_data[0], before);
+        assert!(!d.drive[0].modified);
+    }
+
+    #[test]
+    fn same_timestamp_is_idempotent() {
+        let mut d = fixture();
+        d.update_cycles(99);
+        let before = signature(&d);
+        d.update_cycles(99);
+        assert_eq!(before, signature(&d));
+    }
+
+    #[test]
+    fn disk_head_advances_one_bit_per_four_cpu_cycles_in_read_and_write_modes() {
+        for writing in [false, true] {
+            let mut d = fixture();
+            d.q7 = writing;
+            d.q6 = writing;
+            d.bus = 0xa5;
+            d.update_cycles(1); // Establish the first bit-cell phase.
+            let first = d.drive[0].head * 8 + d.drive[0].head_bit;
+            d.update_cycles(5);
+            let second = d.drive[0].head * 8 + d.drive[0].head_bit;
+            d.update_cycles(9);
+            let third = d.drive[0].head * 8 + d.drive[0].head_bit;
+            assert_eq!(second, first + 1, "writing={writing}");
+            assert_eq!(third, second + 1, "writing={writing}");
+        }
+    }
+
+    #[test]
+    fn read_head_wraps_at_image_track_bit_count_and_increments_revolution() {
+        let mut d = fixture();
+        d.drive[0].raw_track_bits[0] = 64;
+        d.update_cycles(253); // First cell plus 63 four-cycle intervals: 64 bits.
+        assert_eq!(d.drive[0].revolution, 0);
+        d.update_cycles(257); // Next cell wraps the 64-bit track.
+        assert_eq!(d.drive[0].revolution, 1);
+        assert_eq!((d.drive[0].head, d.drive[0].head_bit, d.drive[0].head_mask), (0, 1, 0x40));
+    }
+
+    #[test]
+    fn stopped_motor_freezes_read_position_even_when_cycles_advance() {
+        let mut d = fixture();
+        d.drive[0].motor_status = false;
+        let head = (d.drive[0].head, d.drive[0].head_bit, d.drive[0].head_mask);
+        d.update_cycles(1000);
+        assert_eq!((d.drive[0].head, d.drive[0].head_bit, d.drive[0].head_mask), head);
+    }
+
 }
