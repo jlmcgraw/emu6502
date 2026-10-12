@@ -1424,7 +1424,18 @@ impl DiskDrive {
     }
 
     pub fn reset(&mut self) {
-        self.motor_status(false);
+        self.pending_ticks = 0;
+        self.pending_elapsed_ticks = 0;
+        self.pending_start_cycle = self.cycles;
+        self.fast_disk_timer = 0;
+        self.stepper_pending = false;
+        for disk in &mut self.drive {
+            disk.motor_status = false;
+        }
+        self.drive_select = 0;
+        self.q6 = false;
+        self.q7 = false;
+        self.phase = 0;
         self.reset_disk_sound_sample();
         self.iwm_mode = 0;
     }
@@ -3357,6 +3368,70 @@ mod accuracy_tests {
         }
         b.update_cycles(100);
         assert_eq!(signature(&a), signature(&b));
+    }
+
+    #[test]
+    fn reset_disables_motor_immediately() {
+        let mut d = fixture();
+        d.reset();
+        assert!(!d.is_motor_on());
+        assert_eq!(d.pending_ticks, 0);
+    }
+
+    #[test]
+    fn reset_clears_switches_and_selects_drive_one() {
+        let mut d = fixture();
+        d.q6 = true; d.q7 = true; d.phase = 15;
+        d.drive_select(1);
+        d.reset();
+        assert_eq!((d.q6, d.q7, d.phase, d.drive_select), (false, false, 0, 0));
+    }
+
+    #[test]
+    fn reset_clears_every_controller_combination_and_both_motors() {
+        for selected in 0..2 {
+            for q6 in [false, true] {
+                for q7 in [false, true] {
+                    for phase in 0..16 {
+                        for motors in 0..4 {
+                            let mut d = fixture();
+                            d.drive[0].motor_status = motors & 1 != 0;
+                            d.drive[1].motor_status = motors & 2 != 0;
+                            d.drive_select = selected;
+                            d.q6 = q6;
+                            d.q7 = q7;
+                            d.phase = phase;
+                            d.pending_ticks = 17;
+                            d.pending_elapsed_ticks = 3;
+                            d.stepper_pending = true;
+                            d.reset();
+                            assert_eq!(d.drive_select, 0);
+                            assert_eq!((d.q6, d.q7, d.phase), (false, false, 0));
+                            assert_eq!(d.drive.iter().map(|drive| drive.motor_status).collect::<Vec<_>>(), [false, false]);
+                            assert_eq!((d.pending_ticks, d.pending_elapsed_ticks), (0, 0));
+                            assert!(!d.stepper_pending);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn motor_off_countdown_cancels_on_restart_and_reset_discards_it() {
+        let mut d = fixture();
+        d.motor_status(false);
+        assert_eq!(d.pending_ticks, PENDING_WAIT);
+        d.tick();
+        d.motor_status(true);
+        assert_eq!(d.pending_ticks, 0);
+        assert!(d.drive[0].motor_status);
+
+        d.motor_status(false);
+        d.tick();
+        d.reset();
+        assert_eq!(d.pending_ticks, 0);
+        assert!(!d.drive[0].motor_status);
     }
 
 }
