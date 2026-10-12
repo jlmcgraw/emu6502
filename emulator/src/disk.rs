@@ -2691,7 +2691,7 @@ impl DiskDrive {
 
     fn is_write_protected(&self) -> bool {
         let disk = &self.drive[self.drive_select];
-        disk.write_protect
+        disk.write_protect || self.phase & (1 << 1) != 0
     }
 
     fn write_track(&mut self, track_to_write: u8, write_value: bool, write_protected: bool) {
@@ -2718,16 +2718,6 @@ impl DiskDrive {
             }
 
             if !write_protected {
-                if !self.exact_write {
-                    if track_to_write > 0 {
-                        disk.tmap_data[(track_to_write - 1) as usize] = tmap_track;
-                    }
-
-                    if track_to_write + 1 < 160 {
-                        disk.tmap_data[(track_to_write + 1) as usize] = tmap_track;
-                    }
-                }
-
                 let mut value = track[disk.head];
                 let _oldvalue = track[disk.head];
 
@@ -2739,6 +2729,36 @@ impl DiskDrive {
 
                 track[disk.head] = value;
                 disk.modified = true;
+
+                if !self.exact_write {
+                    let bit_position = disk.head * 8 + disk.head_bit;
+                    for adjacent_track in [track_to_write.checked_sub(1), track_to_write.checked_add(1)]
+                        .into_iter()
+                        .flatten()
+                        .filter(|track| (*track as usize) < disk.tmap_data.len())
+                    {
+                        let adjacent_map = disk.tmap_data[adjacent_track as usize] as usize;
+                        if adjacent_map == 0xff || adjacent_map == tmap_track as usize {
+                            continue;
+                        }
+
+                        let adjacent_bits = disk.raw_track_bits[adjacent_map];
+                        if adjacent_bits == 0 || disk.raw_track_data[adjacent_map].is_empty() {
+                            continue;
+                        }
+
+                        let adjacent_position = bit_position % adjacent_bits;
+                        let byte = adjacent_position / 8;
+                        let mask = 1 << (7 - adjacent_position % 8);
+                        let adjacent_data = &mut disk.raw_track_data[adjacent_map];
+                        if write_value {
+                            adjacent_data[byte] |= mask;
+                        } else {
+                            adjacent_data[byte] &= !mask;
+                        }
+                        disk.modified = true;
+                    }
+                }
             }
 
             /*
@@ -3434,4 +3454,140 @@ mod accuracy_tests {
         assert!(!d.drive[0].motor_status);
     }
 
-}
+    #[test]
+    fn write_protected_media_and_mapping_are_unchanged() {
+        let mut d = fixture();
+        d.drive[0].write_protect = true;
+        d.exact_write = false;
+        let before = format!("{:?}", d.drive[0]);
+        d.write_track(4, true, d.is_write_protected());
+        assert_eq!(before, format!("{:?}", d.drive[0]));
+    }
+
+    #[test]
+    fn phase_one_asserts_write_protect() {
+        let mut d = fixture();
+        assert!(!d.is_write_protected());
+        d.set_phase(1, true);
+        assert!(d.is_write_protected());
+        d.set_phase(1, false);
+        assert!(!d.is_write_protected());
+    }
+
+    #[test]
+    fn phase_one_soft_switch_blocks_media_writes() {
+        let mut d = fixture();
+        let (mut mem, mut video) = (Mmu::new(), Video::new());
+        let before = d.drive[0].raw_track_data[0].clone();
+        d.io_access(0, &mut mem, &mut video, 0xc083, 0, false);
+        assert!(d.is_write_protected());
+
+        // Clearing the first track bit would alter 0x96 in the unprotected case.
+        d.write_track(4, false, d.is_write_protected());
+        assert_eq!(d.drive[0].raw_track_data[0], before);
+        assert!(!d.drive[0].modified);
+    }
+
+    #[test]
+    fn exact_write_changes_only_addressed_bit() {
+        let mut d = fixture();
+        let before = d.drive[0].raw_track_data[0].clone();
+        d.write_track(4, false, false);
+        let mut expected = before;
+        expected[0] &= 0x7f;
+        assert_eq!(d.drive[0].raw_track_data[0], expected);
+        assert!(d.drive[0].modified);
+    }
+
+    #[test]
+    fn partial_write_preserves_distant_adjacent_track_data() {
+        let mut d = fixture();
+        d.exact_write = false;
+        d.drive[0].raw_track_data[1] = vec![0x55; 6378];
+        d.drive[0].raw_track_bits[1] = 51024;
+        d.drive[0].trackmap[1] = TrackType::Tmap;
+        d.drive[0].tmap_data[3] = 1;
+        d.write_track(4, false, false);
+        let adjacent = d.drive[0].tmap_data[3] as usize;
+        assert_eq!(d.drive[0].raw_track_data[adjacent][1000], 0x55);
+    }
+
+    // Independent, short transition vectors from Sather Fig. 9.11 (DOS 3.3).
+    // Each tuple: state, QA/latch bit 7, pulse, expected next state, expected latch.
+    #[test]
+    fn sequencer_read_pulse_boundary_vectors() {
+        for (state, latch, pulse, next, value) in [
+            (0x20, 0x80, 0, 0x20, 0x80),
+            (0x20, 0x80, 1, 0x00, 0x80),
+            (0x30, 0x80, 1, 0x40, 0x80),
+            (0x40, 0x80, 1, 0xd0, 0x80),
+            (0xf0, 0x80, 0, 0xe0, 0x00),
+            (0x10, 0x01, 0, 0x20, 0x03),
+            (0xa0, 0x01, 1, 0xc0, 0x03),
+        ] {
+            let mut d = fixture();
+            d.lss_state = state; d.latch = latch; d.pulse = pulse;
+            d.step_lss();
+            assert_eq!((d.lss_state, d.latch), (next, value),
+                       "state={state:02x}, latch={latch:02x}, pulse={pulse}");
+        }
+    }
+
+    #[test]
+    fn sequencer_write_load_occurs_only_at_load_state() {
+        let mut d = fixture();
+        d.q7 = true; d.q6 = true; d.bus = 0xa5; d.latch = 0x81;
+        d.lss_state = 0x10;
+        d.step_lss();
+        assert_eq!(d.latch, 0x81);
+        d.step_lss();
+        assert_eq!(d.latch, 0xa5);
+    }
+
+    #[test]
+    fn sequencer_protection_sense_shifts_right() {
+        let mut d = fixture();
+        d.q6 = true; d.latch = 0x02; d.drive[0].write_protect = true;
+        d.step_lss();
+        assert_eq!(d.latch, 0x81);
+    }
+
+    #[test]
+    fn io_write_loads_bus_before_later_sequencer_load() {
+        let mut d = fixture();
+        let (mut mem, mut video) = (Mmu::new(), Video::new());
+        d.q7 = true; d.lss_state = 0x20;
+        d.io_access(0, &mut mem, &mut video, 0xc0ed, 0xa5, true);
+        assert!(d.q6);
+        d.step_lss();
+        assert_eq!(d.latch, 0xa5);
+    }
+
+    #[test]
+    fn synthetic_sync_word_has_two_zero_bit_extension() {
+        let mut bytes = vec![0; 4];
+        let end = bits_write_sync(&mut bytes, 0);
+        assert_eq!(end, 10);
+        let bits: Vec<_> = (0..10).map(|i| (bytes[i / 8] >> (7 - i % 8)) & 1).collect();
+        assert_eq!(bits, [1,1,1,1,1,1,1,1,0,0]);
+    }
+
+    #[test]
+    fn sector_image_conversion_is_deterministic() {
+        let data: Vec<u8> = (0..DSK_IMAGE_SIZE).map(|i| (i ^ (i >> 8)) as u8).collect();
+        let (mut a, mut b) = (DiskDrive::new(), DiskDrive::new());
+        a.load_dsk_po_array_to_woz(&data, false, false).unwrap();
+        b.load_dsk_po_array_to_woz(&data, false, false).unwrap();
+        assert!(a.drive[0].raw_track_data == b.drive[0].raw_track_data, "media bytes differ");
+        assert_eq!(a.drive[0].raw_track_bits, b.drive[0].raw_track_bits);
+        assert!(a.drive[0].raw_track_bits.iter().any(|n| *n > 0));
+    }
+
+    #[test]
+    fn thirteen_sector_flag_selects_a_distinct_boot_rom() {
+        let mut d = fixture();
+        let normal: Vec<_> = (0..=255).map(|offset| d.read_rom(offset)).collect();
+        d.drive[0].disk_rom13 = true;
+        let old: Vec<_> = (0..=255).map(|offset| d.read_rom(offset)).collect();
+        assert_ne!(normal, old);
+    }}
