@@ -185,6 +185,8 @@ pub struct DiskDrive {
 
     #[cfg_attr(feature = "serde_support", serde(default))]
     disable_disk_jitter: bool,
+
+    stepper_pending: bool,
 }
 
 // Q0L: Phase 0 OFF
@@ -1411,6 +1413,7 @@ impl DiskDrive {
             disk_sound: DiskSound::default(),
             exact_write: false,
             disable_disk_jitter: false,
+            stepper_pending: false,
         }
     }
 
@@ -1487,6 +1490,13 @@ impl DiskDrive {
     }
 
     fn update_cycles(&mut self, cycles: usize) {
+        let elapsed_cycles = cycles.saturating_sub(self.cycles);
+        if elapsed_cycles > 0 && self.stepper_pending {
+            if self.drive[self.drive_select].motor_status {
+                self.update_disk_phase_position();
+            }
+            self.stepper_pending = false;
+        }
         if self.is_motor_on() && cycles != self.cycles {
             let elapsed_cycles = cycles.saturating_sub(self.cycles);
             let disk_loaded = self.is_loaded(self.drive_select);
@@ -1508,12 +1518,15 @@ impl DiskDrive {
     }
 
     fn set_phase(&mut self, phase: usize, flag: bool) {
+        let old_phase = self.phase;
         if flag {
             self.phase |= 1 << phase;
         } else {
             self.phase &= !(1 << phase);
         }
-        self.update_disk_phase_position();
+        if self.phase != old_phase && self.drive[self.drive_select].motor_status {
+            self.stepper_pending = true;
+        }
     }
 
     fn update_disk_phase_position(&mut self) {
@@ -3133,4 +3146,167 @@ mod accuracy_tests {
         assert_eq!((d.drive[0].head, d.drive[0].head_bit, d.drive[0].head_mask), head);
     }
 
+    #[test]
+    fn disabled_drive_does_not_step() {
+        let mut d = fixture();
+        d.drive[0].motor_status = false;
+        let track = d.drive[0].track;
+        d.set_phase(3, true);
+        assert_eq!(d.drive[0].track, track);
+    }
+
+    #[test]
+    fn phase_change_does_not_instantly_move_physical_head() {
+        let mut d = fixture();
+        let track = d.drive[0].track;
+        d.set_phase(3, true); // no emulated time passes
+        assert_eq!(d.drive[0].track, track);
+    }
+
+    #[test]
+    fn stepping_selected_drive_leaves_other_head_unchanged() {
+        let mut d = fixture();
+        let other = d.drive[1].track;
+        d.set_phase(3, true);
+        assert_eq!(d.drive[1].track, other);
+    }
+
+    // The Disk II stepper has eight half-track positions and sixteen possible
+    // phase-coil masks. These vectors exercise every mask against every position;
+    // they validate the discrete controller model, not physical settling time.
+    #[test]
+    fn stepper_phase_masks_cover_all_discrete_transitions() {
+        const PHASE_POSITION: [i16; 16] = [
+            -1, 0, 2, 1, 4, -1, 3, -1, 6, 7, -1, -1, 5, -1, -1, -1,
+        ];
+        const DIRECTION: [[i16; 8]; 8] = [
+            [0, 1, 2, 3, 0, -3, -2, -1],
+            [-1, 0, 1, 2, 3, 0, -3, -2],
+            [-2, -1, 0, 1, 2, 3, 0, -3],
+            [-3, -2, -1, 0, 1, 2, 3, 0],
+            [0, -3, -2, -1, 0, 1, 2, 3],
+            [3, 0, -3, -2, -1, 0, 1, 2],
+            [2, 3, 0, -3, -2, -1, 0, 1],
+            [1, 2, 3, 0, -3, -2, -1, 0],
+        ];
+
+        for starting_position in 0..8 {
+            for mask in 0..16 {
+                let mut d = fixture();
+                d.drive[0].track = starting_position as u8;
+                d.drive[0].last_track = starting_position as u8;
+                // Set phase coils without consuming emulated time.
+                for phase in 0..4 {
+                    d.set_phase(phase, mask & (1 << phase) != 0);
+                }
+                assert_eq!(d.drive[0].track, starting_position as u8,
+                    "head moved at phase write: start={starting_position}, mask={mask:04b}");
+                d.update_cycles(1);
+
+                let position = PHASE_POSITION[mask];
+                let delta = if position < 0 {
+                    0
+                } else {
+                    DIRECTION[starting_position][position as usize]
+                };
+                let expected = (starting_position as i16 + delta).clamp(0, 159) as u8;
+                assert_eq!(d.drive[0].track, expected,
+                    "start={starting_position}, mask={mask:04b}, position={position}");
+            }
+        }
+    }
+
+    #[test]
+    fn stepper_clamps_at_both_physical_track_limits() {
+        for (track, phase, expected) in [(0, 0b0100, 0), (159, 0b0010, 159)] {
+            let mut d = fixture();
+            d.drive[0].track = track;
+            for index in 0..4 {
+                d.set_phase(index, phase & (1 << index) != 0);
+            }
+            d.update_cycles(1);
+            assert_eq!(d.drive[0].track, expected);
+        }
+    }
+
+    #[test]
+    fn phase_coil_changes_schedule_one_step_and_idempotent_writes_do_not() {
+        let mut d = fixture();
+        d.stepper_pending = false;
+        d.set_phase(0, false);
+        assert!(!d.stepper_pending);
+        d.set_phase(0, true);
+        assert!(d.stepper_pending);
+        d.update_cycles(1);
+        assert!(!d.stepper_pending);
+        let track_after_step = d.drive[0].track;
+        d.update_cycles(2);
+        assert_eq!(d.drive[0].track, track_after_step, "one coil transition was applied twice");
+    }
+
+    #[test]
+    fn soft_switches_drive_phase_and_q6_q7_states() {
+        for (switch, expected_phase) in [
+            (0x81, 0b0001), (0x83, 0b0010), (0x85, 0b0100), (0x87, 0b1000),
+            (0x80, 0b0000), (0x82, 0b0000), (0x84, 0b0000), (0x86, 0b0000),
+        ] {
+            let mut d = fixture();
+            let (mut mem, mut video) = (Mmu::new(), Video::new());
+            d.io_access(0, &mut mem, &mut video, 0xc000 | switch, 0, false);
+            assert_eq!(d.phase, expected_phase, "soft switch ${switch:02x}");
+            assert_eq!(d.drive[0].track, 4, "phase write moved head before time advanced");
+        }
+
+        for (q6, q7, switches) in [
+            (false, false, &[0x8e][..]),
+            (true, false, &[0x8d][..]),
+            (false, true, &[0x8f][..]),
+            (true, true, &[0x8f, 0x8d][..]),
+        ] {
+            let mut d = fixture();
+            let (mut mem, mut video) = (Mmu::new(), Video::new());
+            for &switch in switches {
+                d.io_access(0, &mut mem, &mut video, 0xc000 | switch, 0, false);
+            }
+            assert_eq!((d.q6, d.q7), (q6, q7));
+        }
+    }
+
+    #[test]
+    fn drive_select_transfers_motor_to_only_selected_drive() {
+        let mut d = fixture();
+        assert!(d.drive[0].motor_status);
+        assert!(!d.drive[1].motor_status);
+        d.drive_select(1);
+        assert_eq!(d.drive_select, 1);
+        assert!(!d.drive[0].motor_status);
+        assert!(d.drive[1].motor_status);
+        d.drive_select(0);
+        assert_eq!(d.drive_select, 0);
+        assert!(d.drive[0].motor_status);
+        assert!(!d.drive[1].motor_status);
+    }
+
+    #[test]
+    fn io_phase_switch_takes_effect_on_its_bus_cycle_then_steps_after_time_advances() {
+        let mut d = fixture();
+        d.drive[0].track = 7;
+        d.drive[0].last_track = 7;
+        let (mut mem, mut video) = (Mmu::new(), Video::new());
+
+        // The I/O access first advances the controller through cycle 4, then
+        // asserts phase 0. No mechanical step is applied in that same call.
+        d.io_access(4, &mut mem, &mut video, 0xc081, 0, false);
+        assert_eq!(d.drive[0].track, 7);
+        assert_eq!(d.phase, 1);
+
+        // Advancing to the next bus cycle commits the pending logical step.
+        d.io_access(5, &mut mem, &mut video, 0xc080, 0, false);
+        assert_eq!(d.drive[0].track, 8);
+        assert_eq!(d.phase, 0);
+    }
+
+    // BMOW's logic-analyzer measurement found about 3.9205 us per written bit,
+    // corresponding to four Apple II CPU cycles per bit cell. Verify this
+    // emulator's steady-state read cursor cadence in CPU cycles (not wall time).
 }
